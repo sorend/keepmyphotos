@@ -1,0 +1,6 @@
+colorama
+python-slugify
+flickrapi
+six
+Unidecode
+urllib3
