@@ -46,4 +46,4 @@ Run with -h argument to see all arguments:
 License
 -------
 
-License is FreeBSD-style.
+License is BSD-style.
