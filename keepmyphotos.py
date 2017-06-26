@@ -37,10 +37,7 @@ try:
 except:
     pass
 
-try:
-    from HTMLParser import HTMLParser   # python2
-except ImportError:
-    from html.parser import HTMLParser  # python3
+from html.parser import HTMLParser  # python3
 
 # the api key for keepmyphotos
 api_key = u'b2aa3882209c7ba57ee0930246f4ce7e'
