@@ -24,21 +24,35 @@
 
 from __future__ import print_function
 
+import logging, yaml, logging.config
 import urllib.request, re, sys, os, shutil, argparse
 from slugify import slugify
-import colorama
+
+import xml.etree.ElementTree as ET
 
 import urllib3
 urllib3.disable_warnings()
 
 from flickrapi import FlickrAPI
-try:
-    import pycurl
-except:
-    pass
-
 from html.parser import HTMLParser  # python3
 
+def setup_logging(
+        default_path='logging.yml',
+        default_level=logging.INFO,
+        env_key='LOG_CFG'):
+    path = default_path
+    value = os.getenv(env_key, None)
+    if value:
+        path = value
+    if os.path.exists(path):
+        with open(path, 'rt') as f:
+            config = yaml.safe_load(f.read())
+        logging.config.dictConfig(config)
+    else:
+        logging.basicConfig(level=default_level)
+
+logger = logging.getLogger(__name__)
+        
 # the api key for keepmyphotos
 api_key = u'b2aa3882209c7ba57ee0930246f4ce7e'
 api_secret = u'cf1da08d96ce0671'
@@ -103,13 +117,10 @@ class KeepMyPhotos(object):
         self.flickr = flickr
         self.args = args
         self.path = args.dir
-        try:
-            import pycurl
+        if args.use_pycurl:
             self.downloader = LibcurlInterface()
-            print("Using libcurl downloader")
-        except:
+        else:
             self.downloader = UrllibInterface()
-            print("Using urllib downloader (install pycurl for more speed)")
 
     def find_user_id(url):
         """
@@ -131,21 +142,21 @@ class KeepMyPhotos(object):
     def text_or_none(self, pxml, str):
         pxml.find(str).text if pxml.find(str) is not None else None
 
-    def find_best_size(self, photo_id):
+    def find_best_size(self, photo_id, media):
+
+        label = "Video Original" if media == 'video' else 'Original'
+        
         xml = self.flickr.photos_getSizes(photo_id=photo_id)
-        sizes = []
-        for size in xml.find('sizes').findall('size'):
-            if size.attrib['media'] == 'photo':
-                sizes.append(size)
-        url = sizes[-1].attrib['source']
-        filename = url[url.rfind('/') + 1:]
-        if '_o.' in url:
-            return True, url, filename
-        else:
-            return False, url, filename
+        found = [ x for x in xml.find('sizes').findall('size') if x.attrib['label'] == label ]
+        if len(found) != 1:
+            raise Exception("Found more than one %s" % ET.tostring(xml))
 
-    def download_photo(self, url, save_file):
+        return found[0].attrib["source"]
 
+    def download_media(self, url, save_file):
+
+        logger.info("Downloading %s to %s" % (url, save_file))
+        
         # create a temp file name
         temp_file = save_file + '.temp'
         # temp_file = os.path.join(tempfile.gettempdir(), os.path.basename(save_file))
@@ -168,30 +179,32 @@ class KeepMyPhotos(object):
 
                 # return, we're done
                 return True
-            except pycurl.error:
+            except:
                 pass
 
         return False
 
-    def backup_photo(self, photo, photos_url, slug):
+    def media_timestamp(self, photo_id):
+        xml = self.flickr.photos_getInfo(photo_id=photo_id)
+        logger.info("xml = %s" % xml)
+        dates = xml.find('photo').find("dates")
+        if dates is not None and dates.attrib['taken'] is not None:
+            return dates.attrib['taken'].split(" ")[0] + "-"
+        else:
+            return ""
+    
+    def backup_media(self, photo, photos_url, slug):
 
         photo_id, title = int(photo.attrib['id']), photo.attrib['title']
 
-        original, url, filename = self.find_best_size(photo_id)
-
-        orig = '_o' if original else ''
-
-        save_as = "%d-%s%s.jpg" % (photo_id, slugify(title), orig)
-
-        print("\033[100D\033[K"+colorama.Fore.GREEN+" - %s" % (save_as,), end="")
-        sys.stdout.flush()
+        media = photo.attrib['media']
         
-        if self.args.original_only and not original:
-            raise Exception('Original not found for %s%s/' % (photos_url, photo_id))
+        url = self.find_best_size(photo_id, media)
 
-        # load metadata
-        # xml = self.flickr.photos_getInfo(photo_id=photo_id)
-        # photo = xml.find('photo')
+        extension = "jpg" if media == "photo" else "mp4"
+        taken_date = self.media_timestamp(photo_id)
+        
+        save_as = "%s%s-%d.%s" % (taken_date, slugify(title), photo_id, extension)
 
         # save-location optoins
         save_file = os.path.join(self.path, slug, save_as)
@@ -202,7 +215,7 @@ class KeepMyPhotos(object):
 
         # get the image if we don't have it already
         if not os.path.exists(save_file):
-            self.download_photo(url, save_file)
+            self.download_media(url, save_file)
 
     def find_user_url(self, user_id):
         xml = self.flickr.people_getInfo(user_id=user_id)
@@ -212,21 +225,30 @@ class KeepMyPhotos(object):
         existing_ids = []
         for dirpath in os.listdir(self.path):
             try:
-                photoset_id = int(dirpath.split('-')[0])
+                photoset_id = int(dirpath.split('-')[-1])
             except:
                 photoset_id = '_not_in_set'
 
-            filenames = [ f for f in os.listdir(os.path.join(self.path, dirpath)) if f.endswith('.jpg') ]
+            filenames = [ f for f in os.listdir(os.path.join(self.path, dirpath)) if f.endswith('.jpg') or f.endswith(".mp4") ]
 
             for filename in filenames:
                 try:
-                    photo_id = int(filename.split('-')[0])
+                    photo_id = int(filename.split('-')[-1].split(".")[0])
                     existing_ids.append((photoset_id, photo_id))
                 except:
                     pass
 
         return existing_ids
 
+    def matching_wanted(self, photo):
+            if self.args.videos_only and photo.attrib['media'] != 'video':
+                return False
+            elif self.args.photos_only and photo.attrib['media'] != 'photo':
+                return False
+            else:
+                return True
+        
+    
     def backup_flickr_all(self, user_id):
 
         existing_ids = self.find_existing_photo_ids()
@@ -239,48 +261,54 @@ class KeepMyPhotos(object):
 
             for photoset in photosets:
                 photoset_id, title = int(photoset.attrib['id']), photoset.find('title').text
-                slug = "%d-%s" % (photoset_id, slugify(title))
-                print(colorama.Fore.BLUE + "Processing", title, "slug", slug)
-                walker = self.flickr.walk_set(photoset_id)
+                slug = "%s-%d" % (slugify(title), photoset_id)
+                logger.info("Photoset %s, slug=%s" % (str(title), str(slug)))
+                walker = self.flickr.walk_set(photoset_id, extras="media")
                 for photo in walker:
                     photo_id = int(photo.attrib['id'])
                     if (photoset_id, photo_id) in existing_ids:
                         continue
 
-                    self.backup_photo(photo=photo,
+                    if not self.matching_wanted(photo):
+                        continue
+
+                    self.backup_media(photo=photo,
                                       slug=slug,
                                       photos_url=photos_url)
-                print("")
 
-        photos = self.flickr.photos_getNotInSet().find('photos')
-        print(colorama.Fore.BLUE + "Processing 'not in set'")
+        photos = self.flickr.photos_getNotInSet(extras="media", per_page=500).find('photos')
+        logger.info("Processing 'not in set'")
         for photo in photos:
             photo_id = int(photo.attrib['id'])
             if ('_not_in_set', photo_id) in existing_ids:
                 continue
 
-            self.backup_photo(photo=photo,
+            if not self.matching_wanted(photo):
+                continue
+
+            self.backup_media(photo=photo,
                               photos_url=photos_url,
                               slug='_not_in_set')
-        print("")
-        print(colorama.Fore.GREEN + "All done :-)")
+        logger.info("All done :-)")
 
 def main():
     """ Main, for running from command line """
 
     parser = argparse.ArgumentParser(description='Keep My Photos for backup of flickr photos')
+    parser.add_argument('-p', '--photos-only', action='store_true', help="Only download photos")
+    parser.add_argument('-v', '--videos-only', action='store_true', help="Only download videos")
     parser.add_argument('-u', '--url', help='The photos URL of the user eg. http://www.flickr.com/photos/keepmyphotos/')
     parser.add_argument('-d', '--dir', help='The directory where the backup resides', required=True)
     parser.add_argument('-i', '--id', help='The flickr user ID eg 12345678@N01')
-    parser.add_argument('-o', '--original-only', help='Fail if original photos are not available', action='store_true')
     parser.add_argument('-N', '--not-in-set-only', help='Process "not in set" pictures only.', action='store_true')
+    parser.add_argument('--use-pycurl', action='store_true', help='Use pyCurl for downloading')
     args = parser.parse_args()
 
     if args.url is not None:
         args.id = KeepMyPhotos.find_user_id(args.url)
 
     if args.id is None:
-        print(colorama.Fore.RED + "Please specify -u <photostream url> OR -i user@id")
+        print("Please specify -u <photostream url> OR -i user@id")
     else:
         # get api
         flickr = FlickrAPI(api_key, api_secret)
@@ -289,7 +317,7 @@ def main():
         if not flickr.token_valid(perms=api_access_level):
             flickr.get_request_token(oauth_callback='oob')
             authorize_url = flickr.auth_url(perms=api_access_level)
-            print("Open authorize_url: %s" % (authorize_url,))
+            print("Open authorize_url", authorize_url)
             verifier = input('Verifier code: ')
             flickr.get_access_token(verifier)
 
@@ -297,4 +325,5 @@ def main():
         kmp.backup_flickr_all(args.id)
 
 if __name__ == "__main__":
+    setup_logging()  # start logging
     main()
